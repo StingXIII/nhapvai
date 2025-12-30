@@ -1,11 +1,11 @@
 
-
 import { GameState, SaveSlot, TurnVector, SummaryVector, PendingVectorItem } from '../types';
 import * as dbService from './dbService';
 import * as embeddingService from './ai/embeddingService';
 import * as ragService from './ai/ragService';
 import { getSettings } from './settingsService';
 import { setDebugContext, resetRequestStats, printRequestStats } from './core/geminiClient';
+import * as firebaseService from './firebaseService';
 
 const LEGACY_SAVES_STORAGE_KEY = 'ai_rpg_all_saves';
 const MAX_MANUAL_SAVES = 5;
@@ -46,7 +46,6 @@ export const migrateSaves = (): Promise<void> => {
         if (legacySaves.length > 0) {
             console.log(`Migrating ${legacySaves.length} saves from localStorage to IndexedDB...`);
             try {
-                // Save saves from oldest to newest to maintain order if trimming is needed
                 for (const save of legacySaves.reverse()) {
                     await dbService.addSave(save);
                 }
@@ -54,7 +53,6 @@ export const migrateSaves = (): Promise<void> => {
                 console.log('Migration successful.');
             } catch (error) {
                 console.error('Migration failed:', error);
-                // Don't clear old saves if migration fails
             }
         }
     })();
@@ -65,7 +63,7 @@ export const migrateSaves = (): Promise<void> => {
 // --- New IndexedDB-based functions ---
 
 const trimSaves = async (): Promise<void> => {
-    const allSaves = await dbService.getAllSaves(); // Assumes saves are sorted newest to oldest
+    const allSaves = await dbService.getAllSaves();
     const manualSaves = allSaves.filter(s => s.saveType === 'manual');
     const autoSaves = allSaves.filter(s => s.saveType === 'auto');
 
@@ -87,24 +85,15 @@ const trimSaves = async (): Promise<void> => {
 };
 
 export const loadAllSaves = async (): Promise<SaveSlot[]> => {
-    // Console log để xác nhận việc load danh sách save không tốn request
     console.groupCollapsed('📂 [DEBUG STATS] Load Saves List');
     console.log('%c✅ Không tốn request nào. (Chỉ đọc từ IndexedDB)', 'color: #4ade80; font-weight: bold;');
     console.groupEnd();
     return dbService.getAllSaves();
 };
 
-/**
- * Tạo một PendingVectorItem cho lượt chơi vừa xong để đưa vào hàng đợi.
- * Hàm này thay thế cho việc gọi AI contextization và embedding ngay lập tức.
- * @param turnIndex Index của lượt chơi trong history.
- * @param content Nội dung của lượt chơi.
- * @param previousTurnContent Nội dung của lượt trước đó (để gộp ngữ cảnh).
- */
 export function createTurnVectorItem(turnIndex: number, content: string, previousTurnContent?: string): PendingVectorItem {
     let combinedContent = content;
     if (previousTurnContent) {
-        // Dùng thuật toán nối chuỗi thay vì gọi AI, giống logic cũ nhưng giờ chỉ chuẩn bị text
         combinedContent = `[Ngữ cảnh trước đó: ${previousTurnContent.substring(0, 300)}...]\n[Nội dung chính: ${content}]`;
     }
     
@@ -115,14 +104,7 @@ export function createTurnVectorItem(turnIndex: number, content: string, previou
     };
 }
 
-/**
- * Hàm cũ: vectorizePendingTurns.
- * Hiện tại đã được thay thế bằng cơ chế "Ký gửi Vector" (Piggyback).
- * Hàm này được giữ lại nhưng để trống để tránh lỗi undefined nếu còn sót nơi gọi (dù đã xóa ở GameplayScreen).
- * Logic vector hóa thực tế đã chuyển sang `gameLoopService.ts` -> `getNextTurn`.
- */
 export async function vectorizePendingTurns(gameState: GameState): Promise<void> {
-    // No-op. Logic has moved to Piggyback Vectorization strategy.
     if (process.env.NODE_ENV === 'development') {
         console.warn("vectorizePendingTurns is deprecated. Use pendingVectorBuffer in GameState instead.");
     }
@@ -140,7 +122,7 @@ export const saveGame = async (gameState: GameState, saveType: 'manual' | 'auto'
 
     const newSave: SaveSlot = {
       ...gameState,
-      worldId: gameState.worldId || Date.now(), // Đảm bảo worldId luôn tồn tại khi lưu
+      worldId: gameState.worldId || Date.now(),
       worldName: gameState.worldConfig.storyContext.worldName || 'Cuộc phiêu lưu không tên',
       saveId: Date.now(),
       saveDate: new Date().toISOString(),
@@ -148,7 +130,6 @@ export const saveGame = async (gameState: GameState, saveType: 'manual' | 'auto'
       saveType: saveType,
     };
     
-    // Gán worldId = saveId cho các save cũ chưa có
     if (!newSave.worldId) {
         newSave.worldId = newSave.saveId;
     }
@@ -156,8 +137,11 @@ export const saveGame = async (gameState: GameState, saveType: 'manual' | 'auto'
     await dbService.addSave(newSave);
     await trimSaves();
 
-    // Log xác nhận việc lưu bản ghi
-    console.log(`%c💾 [GAME SAVED] Đã lưu game (${saveType}) thành công vào IndexedDB (0 Request).`, 'color: #3b82f6;');
+    // CLOUD SYNC: Đẩy bản lưu lên Firebase
+    // Chúng ta không dùng await ở đây để không làm chậm trải nghiệm UI
+    firebaseService.syncSaveToCloud(newSave).catch(e => console.error("Cloud Save failed:", e));
+
+    console.log(`%c💾 [GAME SAVED] Đã lưu game (${saveType}) thành công vào cục bộ và Cloud.`, 'color: #3b82f6;');
 
   } catch (error) {
     console.error('Error saving game state:', error);
@@ -167,17 +151,13 @@ export const saveGame = async (gameState: GameState, saveType: 'manual' | 'auto'
 
 
 export const deleteSave = async (saveId: number): Promise<void> => {
-    // Sửa logic để xóa cả các vector liên quan khi xóa một save slot
     const saveToDelete = await dbService.getAllSaves().then(s => s.find(sv => sv.saveId === saveId));
     if (saveToDelete && saveToDelete.worldId) {
-        // Lấy worldId trước khi xóa
         const worldIdToDelete = saveToDelete.worldId;
-        // Xóa save slot
         await dbService.deleteSave(saveId);
         
-        // Xóa các vector có cùng worldId
         const turnVectors = await dbService.getAllTurnVectors(worldIdToDelete);
-        for(const v of turnVectors) await dbService.deleteSave(v.turnId); // Assuming deleteSave can handle other stores based on some logic not shown
+        for(const v of turnVectors) await dbService.deleteSave(v.turnId);
 
         const summaryVectors = await dbService.getAllSummaryVectors(worldIdToDelete);
         for(const v of summaryVectors) await dbService.deleteSave(v.summaryId);
@@ -191,7 +171,6 @@ export const deleteSave = async (saveId: number): Promise<void> => {
 
 
 export const hasSavedGames = async (): Promise<boolean> => {
-  // Check legacy storage first in case migration hasn't run
     if (loadAllSavesFromLocalStorage().length > 0) {
         return true;
     }

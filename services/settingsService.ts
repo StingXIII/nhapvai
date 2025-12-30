@@ -1,9 +1,10 @@
+
 import { AppSettings, ApiKeyStorage, SafetySettingsConfig, RagSettings } from '../types';
 import { DEFAULT_SAFETY_SETTINGS, DEFAULT_RAG_SETTINGS, DEFAULT_AI_PERFORMANCE_SETTINGS } from '../constants';
+import * as firebaseService from './firebaseService';
 
 const SETTINGS_STORAGE_KEY = 'ai_rpg_settings';
 
-// Default structure for a new user
 const DEFAULT_SETTINGS: AppSettings = {
   apiKeyConfig: { keys: [] },
   safetySettings: DEFAULT_SAFETY_SETTINGS,
@@ -16,7 +17,6 @@ export const getSettings = (): AppSettings => {
     const storedSettings = localStorage.getItem(SETTINGS_STORAGE_KEY);
     if (storedSettings) {
       const parsed = JSON.parse(storedSettings) as Partial<AppSettings>;
-      // Merge parsed settings with defaults to ensure all keys exist
       const mergedSettings: AppSettings = {
         ...DEFAULT_SETTINGS,
         ...parsed,
@@ -43,6 +43,10 @@ export const getSettings = (): AppSettings => {
 export const saveSettings = (settings: AppSettings): void => {
   try {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    
+    // CLOUD SYNC: Đẩy cấu hình (API Keys) lên Firebase
+    firebaseService.syncSettingsToCloud(settings).catch(e => console.error("Cloud Settings sync failed:", e));
+
   } catch (error) {
     console.error('Error saving settings to localStorage:', error);
   }
