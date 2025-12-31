@@ -6,7 +6,7 @@ import SettingsScreen from './components/SettingsScreen';
 import GameplayScreen from './components/GameplayScreen';
 import FandomGenesisScreen from './components/FandomGenesisScreen';
 import DebugScreen from './components/DebugScreen';
-import { WorldConfig, GameState, InitialEntity, NpcDossier, EncounteredNPC, PlayerStats, GameItem, EncounteredFaction } from './types';
+import { WorldConfig, GameState, InitialEntity, NpcDossier, EncounteredNPC, PlayerStats, GameItem, EncounteredFaction, SaveSlot } from './types';
 import { DEFAULT_STATS, SUB_REALM_NAMES } from './constants';
 import { DEFAULT_PLAYER_STATS } from './constants/character';
 import { getSeason, generateWeather } from './utils/timeUtils';
@@ -40,8 +40,8 @@ const App: React.FC = () => {
             }
             
             if (lastSave) {
-                // Lưu vào IndexedDB cục bộ để user có thể bấm "Tải game"
-                await gameService.saveGame(lastSave, 'auto');
+                // SỬ DỤNG importExternalSave để giữ nguyên ID từ Cloud, tránh trùng lặp
+                await gameService.importExternalSave(lastSave);
                 console.log("✅ Đã đồng bộ bản lưu từ Cloud về máy.");
             }
         } catch (e) {
