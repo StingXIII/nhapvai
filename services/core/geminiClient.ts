@@ -3,12 +3,15 @@ import { GoogleGenAI, HarmCategory, HarmBlockThreshold, type SafetySetting } fro
 import { getSettings } from '../settingsService';
 import { AiPerformanceSettings, SafetySettingsConfig } from '../../types';
 import { DEFAULT_AI_PERFORMANCE_SETTINGS } from '../../constants';
-import { processNarration } from '../../utils/textProcessing';
 
 const DEBUG_MODE = true;
 let currentDebugContext = 'Unknown Source';
 const requestStats: Record<string, number> = {};
 const totalSessionRequests = { count: 0 };
+
+// Global Quota Lock
+let isQuotaLocked = false;
+const QUOTA_LOCK_DURATION = 15000; // 15 giây nghỉ toàn cục
 
 export const setDebugContext = (context: string) => {
     currentDebugContext = context;
@@ -28,17 +31,15 @@ const incrementRequestCount = (model: string) => {
 export const printRequestStats = (actionName: string) => {
     if (!DEBUG_MODE) return;
     const totalTurnRequests = Object.values(requestStats).reduce((a, b) => a + b, 0);
-    console.group(`📊 [DEBUG STATS] Báo cáo tài nguyên cho: ${actionName}`);
+    console.group(`📊 [DEBUG STATS] ${actionName}`);
     if (totalTurnRequests === 0) {
-        console.log('%c✅ Không tốn request nào.', 'color: #4ade80; font-weight: bold;');
+        console.log('%c✅ Không tốn request.', 'color: #4ade80;');
     } else {
         console.table(requestStats);
     }
     console.groupEnd();
 };
 
-let ai: GoogleGenAI | null = null;
-let currentApiKey: string | null = null;
 let keyIndex = 0;
 
 const UNRESTRICTED_SAFETY_SETTINGS: SafetySetting[] = [
@@ -51,31 +52,31 @@ const UNRESTRICTED_SAFETY_SETTINGS: SafetySetting[] = [
 function getAiInstance(): GoogleGenAI {
   const { apiKeyConfig } = getSettings();
   const keys = apiKeyConfig.keys.filter(Boolean);
-
-  if (keys.length === 0) {
-    throw new Error('Không tìm thấy API Key nào. Vui lòng thêm API Key trong phần Cài đặt.');
-  }
+  if (keys.length === 0) throw new Error('Không tìm thấy API Key.');
   
   if (keyIndex >= keys.length) keyIndex = 0;
   const apiKey = keys[keyIndex];
-  
-  ai = new GoogleGenAI({ apiKey });
-  currentApiKey = apiKey;
   keyIndex++;
-  return ai;
+  return new GoogleGenAI({ apiKey });
+}
+
+async function waitForQuota() {
+    if (isQuotaLocked) {
+        console.warn("⏳ Hệ thống đang tạm dừng để hồi phục hạn mức API...");
+        while (isQuotaLocked) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+    }
 }
 
 function handleApiError(error: unknown, safetySettings: SafetySettingsConfig): Error {
     const rawMessage = error instanceof Error ? error.message : String(error);
-    
     if (rawMessage.includes('429') || rawMessage.includes('RESOURCE_EXHAUSTED') || rawMessage.includes('quota')) {
         return new Error('QUOTA_EXCEEDED');
     }
-
     if (safetySettings.enabled && (/safety/i.test(rawMessage) || /blocked/i.test(rawMessage))) {
         return new Error("Nội dung bị chặn bởi bộ lọc an toàn.");
     }
-
     return new Error(`Lỗi từ Gemini API: ${rawMessage}`);
 }
 
@@ -87,45 +88,38 @@ export async function generate(prompt: string, systemInstruction?: string, retry
     let selectedModel = modelOverride || perfSettings.selectedModel || 'gemini-2.5-flash';
     if (selectedModel === 'gemini-3-pro') selectedModel = 'gemini-3-pro-preview';
 
-    const isProModel = selectedModel.includes('pro');
-    const effectiveMaxTokens = (isProModel || selectedModel.includes('gemini-3')) ? 32768 : perfSettings.maxOutputTokens;
-    const effectiveThinkingBudget = (isProModel || selectedModel.includes('gemini-3')) ? 16384 : perfSettings.thinkingBudget;
-
-    const maxAttempts = 1 + retryCount;
-    let lastError: Error | null = null;
     const finalContents = systemInstruction ? `${systemInstruction}\n\n---\n\n${prompt}` : prompt;
 
-    for (let i = 0; i < maxAttempts; i++) {
+    for (let i = 0; i < 1 + retryCount; i++) {
       try {
-        incrementRequestCount(`${selectedModel} (Attempt ${i+1})`);
+        await waitForQuota();
+        incrementRequestCount(`${selectedModel} (M${i+1})`);
         const aiInstance = getAiInstance();
         const response = await aiInstance.models.generateContent({
             model: selectedModel,
             contents: finalContents,
             config: {
                 safetySettings: activeSafetySettings as unknown as SafetySetting[],
-                maxOutputTokens: effectiveMaxTokens,
-                thinkingConfig: { thinkingBudget: effectiveThinkingBudget }
+                maxOutputTokens: selectedModel.includes('flash') ? 8192 : 32768,
+                thinkingConfig: { thinkingBudget: selectedModel.includes('flash') ? 2048 : 16384 }
             }
         });
-        
         if (!response.text) throw new Error("Empty response");
         return response.text.trim();
-
       } catch (error) {
-        lastError = handleApiError(error, safetySettings);
-        
-        if (lastError.message === 'QUOTA_EXCEEDED' && i < maxAttempts - 1) {
-            // Netlify Quota Protection: Tăng thời gian chờ lâu hơn (8s, 16s, 32s)
-            const delayTime = 8000 * Math.pow(2, i);
-            console.warn(`⚠️ Hạn mức API tạm hết (429) trên Netlify. Thử lại sau ${delayTime}ms...`);
+        const lastError = handleApiError(error, safetySettings);
+        if (lastError.message === 'QUOTA_EXCEEDED') {
+            isQuotaLocked = true;
+            const delayTime = 12000 * Math.pow(2, i);
+            console.error(`🚨 CẠN HẠN MỨC (429). Khóa yêu cầu trong ${delayTime}ms...`);
+            setTimeout(() => { isQuotaLocked = false; }, QUOTA_LOCK_DURATION);
             await new Promise(resolve => setTimeout(resolve, delayTime));
             continue;
         }
-        if (i === maxAttempts - 1) throw lastError;
+        if (i === retryCount) throw lastError;
       }
     }
-    throw lastError || new Error("Lỗi không xác định");
+    throw new Error("Lỗi không xác định");
 }
 
 export async function generateJson<T>(prompt: string, schema: any, systemInstruction?: string, model: string = 'gemini-2.5-flash', overrideConfig?: Partial<AiPerformanceSettings>, retryCount: number = 3): Promise<T> {
@@ -136,17 +130,12 @@ export async function generateJson<T>(prompt: string, schema: any, systemInstruc
     let selectedModel = model;
     if (selectedModel === 'gemini-3-pro') selectedModel = 'gemini-3-pro-preview';
 
-    const isProModel = selectedModel.includes('pro');
-    const effectiveMaxTokens = (isProModel || selectedModel.includes('gemini-3')) ? 32768 : (overrideConfig?.maxOutputTokens ?? perfSettings.maxOutputTokens);
-    const effectiveThinkingBudget = (isProModel || selectedModel.includes('gemini-3')) ? 16384 : (overrideConfig?.thinkingBudget ?? perfSettings.thinkingBudget);
-
-    const maxAttempts = 1 + retryCount;
-    let lastError: Error | null = null;
     const finalContents = systemInstruction ? `${systemInstruction}\n\n---\n\n${prompt}` : prompt;
 
-    for (let i = 0; i < maxAttempts; i++) {
+    for (let i = 0; i < 1 + retryCount; i++) {
       try {
-        incrementRequestCount(`${selectedModel} (JSON Attempt ${i+1})`);
+        await waitForQuota();
+        incrementRequestCount(`${selectedModel} (JSON M${i+1})`);
         const aiInstance = getAiInstance();
         const response = await aiInstance.models.generateContent({
             model: selectedModel,
@@ -155,39 +144,35 @@ export async function generateJson<T>(prompt: string, schema: any, systemInstruc
                 responseMimeType: "application/json",
                 responseSchema: schema,
                 safetySettings: activeSafetySettings as unknown as SafetySetting[],
-                maxOutputTokens: effectiveMaxTokens,
-                thinkingConfig: { thinkingBudget: effectiveThinkingBudget }
+                maxOutputTokens: 32768,
+                thinkingConfig: { thinkingBudget: 16384 }
             }
          });
-  
         if (!response.text) throw new Error("Empty JSON");
-        const parsedJson = JSON.parse(response.text) as T;
-        return parsedJson;
-
+        return JSON.parse(response.text) as T;
       } catch (error) {
-        lastError = handleApiError(error, safetySettings);
-        if (lastError.message === 'QUOTA_EXCEEDED' && i < maxAttempts - 1) {
-            const delayTime = 8000 * Math.pow(2, i);
-            console.warn(`⚠️ Hạn mức JSON API tạm hết. Đang thử lại sau ${delayTime}ms...`);
+        const lastError = handleApiError(error, safetySettings);
+        if (lastError.message === 'QUOTA_EXCEEDED') {
+            isQuotaLocked = true;
+            const delayTime = 15000 * Math.pow(2, i);
+            setTimeout(() => { isQuotaLocked = false; }, QUOTA_LOCK_DURATION);
             await new Promise(resolve => setTimeout(resolve, delayTime));
             continue;
         }
-        if (i === maxAttempts - 1) throw lastError;
+        if (i === retryCount) throw lastError;
       }
     }
-    throw lastError || new Error("Lỗi tạo JSON");
+    throw new Error("Lỗi tạo JSON");
 }
 
 export async function generateEmbeddingsBatch(texts: string[]): Promise<number[][]> {
-    incrementRequestCount('text-embedding-004 (Batch)');
+    await waitForQuota();
+    incrementRequestCount('text-embedding-004');
     const aiInstance = getAiInstance();
     const result = await aiInstance.models.embedContent({
         model: "text-embedding-004",
         contents: texts,
     });
-    const embeddings = result.embeddings;
-    if (embeddings && embeddings.length === texts.length) {
-        return embeddings.map(e => e.values);
-    }
+    if (result.embeddings) return result.embeddings.map(e => e.values);
     throw new Error("Lỗi Embedding");
 }
