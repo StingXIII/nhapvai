@@ -59,7 +59,6 @@ function getAiInstance(): GoogleGenAI {
   if (keyIndex >= keys.length) keyIndex = 0;
   const apiKey = keys[keyIndex];
   
-  // Xoay vòng key mỗi lần gọi để tận dụng tối đa hạn mức nếu user nhập nhiều key
   ai = new GoogleGenAI({ apiKey });
   currentApiKey = apiKey;
   keyIndex++;
@@ -68,10 +67,9 @@ function getAiInstance(): GoogleGenAI {
 
 function handleApiError(error: unknown, safetySettings: SafetySettingsConfig): Error {
     const rawMessage = error instanceof Error ? error.message : String(error);
-    console.error('Gemini API Error:', error);
-
-    if (rawMessage.includes('429') || rawMessage.includes('RESOURCE_EXHAUSTED')) {
-        return new Error('QUOTA_EXCEEDED'); // Mã lỗi nội bộ để xử lý retry
+    
+    if (rawMessage.includes('429') || rawMessage.includes('RESOURCE_EXHAUSTED') || rawMessage.includes('quota')) {
+        return new Error('QUOTA_EXCEEDED');
     }
 
     if (safetySettings.enabled && (/safety/i.test(rawMessage) || /blocked/i.test(rawMessage))) {
@@ -117,11 +115,10 @@ export async function generate(prompt: string, systemInstruction?: string, retry
       } catch (error) {
         lastError = handleApiError(error, safetySettings);
         
-        if (lastError.message === 'QUOTA_EXCEEDED') {
-            // Đợi lâu hơn (Exponential Backoff) nếu bị 429
-            // Model Pro thường reset sau 60s, nên lượt thử cuối cần đợi lâu
-            const delayTime = i === maxAttempts - 1 ? 15000 : 3000 * Math.pow(2, i); 
-            console.warn(`⚠️ Hạn mức API tạm hết (429). Đang thử lại sau ${delayTime}ms...`);
+        if (lastError.message === 'QUOTA_EXCEEDED' && i < maxAttempts - 1) {
+            // Netlify Quota Protection: Tăng thời gian chờ lâu hơn (8s, 16s, 32s)
+            const delayTime = 8000 * Math.pow(2, i);
+            console.warn(`⚠️ Hạn mức API tạm hết (429) trên Netlify. Thử lại sau ${delayTime}ms...`);
             await new Promise(resolve => setTimeout(resolve, delayTime));
             continue;
         }
@@ -165,15 +162,13 @@ export async function generateJson<T>(prompt: string, schema: any, systemInstruc
   
         if (!response.text) throw new Error("Empty JSON");
         const parsedJson = JSON.parse(response.text) as T;
-        if (typeof parsedJson === 'object' && parsedJson !== null && 'narration' in parsedJson) {
-            (parsedJson as any).narration = processNarration((parsedJson as any).narration);
-        }
         return parsedJson;
 
       } catch (error) {
         lastError = handleApiError(error, safetySettings);
-        if (lastError.message === 'QUOTA_EXCEEDED') {
-            const delayTime = i === maxAttempts - 1 ? 15000 : 4000 * Math.pow(2, i);
+        if (lastError.message === 'QUOTA_EXCEEDED' && i < maxAttempts - 1) {
+            const delayTime = 8000 * Math.pow(2, i);
+            console.warn(`⚠️ Hạn mức JSON API tạm hết. Đang thử lại sau ${delayTime}ms...`);
             await new Promise(resolve => setTimeout(resolve, delayTime));
             continue;
         }

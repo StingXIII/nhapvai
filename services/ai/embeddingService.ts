@@ -3,13 +3,13 @@ import { generateEmbeddingsBatch } from '../core/geminiClient';
 import { EntityVector } from '../../types';
 import * as dbService from '../dbService';
 
-// Giảm Batch Size xuống 20 (thay vì 100) để tránh nghẽn hạn mức tokens/phút trên Netlify
-const BATCH_SIZE = 20; 
-// Tăng độ trễ giữa các đợt để "nhường" tài nguyên cho các yêu cầu Pro quan trọng hơn
-const DELAY_BETWEEN_BATCHES = 3000; 
+// Giảm Batch Size xuống 5 (thay vì 20) để cực kỳ an toàn trên Netlify
+const BATCH_SIZE = 5; 
+// Tăng độ trễ giữa các đợt để tránh burst traffic
+const DELAY_BETWEEN_BATCHES = 5000; 
 
 /**
- * Tạo embeddings cho mảng văn bản với cơ chế batching an toàn.
+ * Tạo embeddings cho mảng văn bản với cơ chế batching cực kỳ an toàn.
  */
 export async function embedContents(chunks: string[], onProgress: (progress: number) => void = () => {}): Promise<number[][]> {
   if (!chunks || chunks.length === 0) return [];
@@ -32,10 +32,11 @@ export async function embedContents(chunks: string[], onProgress: (progress: num
         }
     } catch (error: any) {
         console.error(`Lỗi embedding batch:`, error);
-        // Nếu bị 429 khi đang embed, đợi lâu hơn nữa
-        if (error.message?.includes('429') || error.message?.includes('QUOTA')) {
-            await new Promise(resolve => setTimeout(resolve, 10000));
-            i -= BATCH_SIZE; // Thử lại chính batch này
+        // Nếu bị 429 khi đang embed, đợi rất lâu (15s)
+        if (error.message?.includes('QUOTA') || error.message?.includes('429')) {
+            console.warn("Dừng 15 giây để hồi phục Quota Embedding...");
+            await new Promise(resolve => setTimeout(resolve, 15000));
+            i -= BATCH_SIZE; // Thử lại batch này
             continue;
         }
         throw new Error(`Lỗi tạo embeddings: ${error.message}`);
