@@ -8,7 +8,7 @@ import { setDebugContext, resetRequestStats, printRequestStats } from './core/ge
 import * as firebaseService from './firebaseService';
 
 const LEGACY_SAVES_STORAGE_KEY = 'ai_rpg_all_saves';
-const MAX_MANUAL_SAVES = 5;
+const MAX_MANUAL_SAVES = 10;
 const MAX_AUTO_SAVES = 10;
 
 const loadAllSavesFromLocalStorage = (): SaveSlot[] => {
@@ -59,10 +59,15 @@ export const loadAllSaves = async (): Promise<SaveSlot[]> => {
     return dbService.getAllSaves();
 };
 
+/**
+ * Nhập bản lưu từ Cloud. 
+ * Đảm bảo ghi đè nếu trùng ID thay vì tạo bản copy.
+ */
 export const importExternalSave = async (save: SaveSlot): Promise<void> => {
+    if (!save || !save.saveId) return;
     try {
         await dbService.addSave(save);
-        console.log("📥 Đã đồng bộ bản lưu từ Cloud.");
+        console.log(`📥 Đã đồng bộ/ghi đè bản lưu ${save.saveId} từ Cloud.`);
     } catch (error) {
         console.error("Lỗi khi import bản lưu:", error);
     }
@@ -79,13 +84,13 @@ export const saveGame = async (gameState: GameState, saveType: 'manual' | 'auto'
         previewText = `${lastTurn.type === 'action' ? 'Bạn' : 'AI'}: ${contentSnippet}...`;
     }
 
-    // Logic quan trọng: Nếu là Auto Save, tìm bản lưu Auto cũ của cùng thế giới để ghi đè (tránh lặp)
-    let saveIdToUse = Date.now();
-    if (saveType === 'auto' && gameState.worldId) {
-        const existingAutoSave = allSaves.find(s => s.worldId === gameState.worldId && s.saveType === 'auto');
-        if (existingAutoSave) {
-            saveIdToUse = existingAutoSave.saveId;
-        }
+    // Logic quan trọng chống lặp:
+    // Nếu worldId đã tồn tại, dùng lại saveId cũ của world đó cho cùng loại save
+    let saveIdToUse = (gameState as any).saveId || Date.now();
+    
+    const existingSameWorldSave = allSaves.find(s => s.worldId === gameState.worldId && s.saveType === saveType);
+    if (existingSameWorldSave) {
+        saveIdToUse = existingSameWorldSave.saveId;
     }
 
     const newSave: SaveSlot = {
@@ -98,11 +103,14 @@ export const saveGame = async (gameState: GameState, saveType: 'manual' | 'auto'
       saveType: saveType,
     };
     
+    // Lưu local (IndexedDB .put sẽ tự động ghi đè nếu trùng saveId)
     await dbService.addSave(newSave);
     await trimSaves();
 
-    // Đồng bộ lên Cloud
-    firebaseService.syncSaveToCloud(newSave).catch(e => console.error("Cloud Save failed:", e));
+    // Chỉ đồng bộ manual lên cloud
+    if (saveType === 'manual') {
+        firebaseService.syncSaveToCloud(newSave).catch(e => console.error("Cloud Save failed:", e));
+    }
 
   } catch (error) {
     console.error('Error saving game state:', error);
@@ -111,15 +119,8 @@ export const saveGame = async (gameState: GameState, saveType: 'manual' | 'auto'
 
 export const deleteSave = async (saveId: number): Promise<void> => {
     try {
-        // Xóa local
         await dbService.deleteSave(saveId);
-
-        // Kiểm tra xem đây có phải bản lưu đang có trên Cloud không (dựa trên slot duy nhất của User)
-        const cloudData = await firebaseService.loadAllFromCloud();
-        if (cloudData.lastSave && cloudData.lastSave.saveId === saveId) {
-            await firebaseService.deleteSaveFromCloud();
-        }
-        
+        await firebaseService.deleteSaveFromCloud(saveId);
         console.log(`🗑️ Đã xóa bản lưu ${saveId} thành công.`);
     } catch (error) {
         console.error("Lỗi khi xóa bản lưu:", error);
